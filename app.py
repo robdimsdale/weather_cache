@@ -1,7 +1,9 @@
+from datetime import datetime
 from flask import Flask
 from flask_apscheduler import APScheduler
-import requests
+import json
 import os
+import requests
 
 
 app = Flask(__name__)
@@ -31,8 +33,13 @@ def update_weather():
 
 
 @app.route('/')
-def weather():
+def show_weather():
     return weather
+
+
+@app.route('/datetime')
+def show_datetime():
+    return json.dumps(datetime.now().isoformat())
 
 
 update_weather()
