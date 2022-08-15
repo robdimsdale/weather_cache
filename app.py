@@ -23,7 +23,7 @@ def update_weather():
         'lon': os.getenv('LON'),
         'appid': os.getenv('APP_ID'),
         'units': os.getenv('UNITS', default='imperial')}
-    r = requests.get("https://api.openweathermap.org/data/2.5/weather?", params=payload)
+    r = requests.get("https://api.openweathermap.org/data/3.0/onecall?", params=payload)
     if r.status_code != 200:
         print('error updating weather')
     else:
