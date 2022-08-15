@@ -41,5 +41,6 @@ def show_weather():
 def show_datetime():
     return json.dumps(datetime.now().isoformat())
 
-
-update_weather()
+if __name__ == '__main__':
+    update_weather()
+    app.run(host="0.0.0.0")
