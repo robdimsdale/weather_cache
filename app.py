@@ -15,7 +15,7 @@ weather = {}
 
 
 # interval example
-@scheduler.task('interval', id='update weather', minutes=15)
+@scheduler.task('interval', id='update weather', minutes=5)
 def update_weather():
     print('Updating weather')
     payload = {
