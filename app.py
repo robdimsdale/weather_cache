@@ -4,6 +4,7 @@ from flask_apscheduler import APScheduler
 import json
 import os
 import requests
+import time
 
 
 app = Flask(__name__)
@@ -36,10 +37,10 @@ def update_weather():
 def show_weather():
     return weather
 
+@app.route('/epoch')
+def show_epoch():
+    return json.dumps(int(time.time()))
 
-@app.route('/datetime')
-def show_datetime():
-    return json.dumps(datetime.now().isoformat())
 
 if __name__ == '__main__':
     update_weather()
