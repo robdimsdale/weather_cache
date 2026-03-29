@@ -38,18 +38,22 @@ class TestEpochEndpoint:
         assert before <= data <= after
 
 
-class TestWeatherEndpoint:
+class TestWeatherEndpointBackwardsCompatibility:
     def test_returns_200(self, client):
         assert client.get('/').status_code == 200
 
+
+class TestOwmOneshotEndpoint:
+    def test_returns_200(self, client):
+        assert client.get('/owm_oneshot').status_code == 200
+
     def test_returns_cached_weather(self, client):
         weather_app.weather = '{"temp": 72}'
-        assert client.get('/').data == b'{"temp": 72}'
+        assert client.get('/owm_oneshot').data == b'{"temp": 72}'
 
     def test_returns_empty_when_not_yet_fetched(self, client):
         weather_app.weather = {}
-        response = client.get('/')
-        assert response.status_code == 200
+        assert client.get('/owm_oneshot').status_code == 200
 
 
 class TestUpdateWeather:

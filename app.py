@@ -37,6 +37,10 @@ def update_weather():
 def show_weather():
     return weather
 
+@app.route('/owm_oneshot')
+def show_owm_oneshot():
+    return weather
+
 @app.route('/epoch')
 def show_epoch():
     return json.dumps(int(time.time()))
