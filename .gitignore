@@ -6,6 +6,7 @@ __pycache__/
 .idea
 
 .env
+ecobee_tokens.json
 .venv
 env/
 venv/
