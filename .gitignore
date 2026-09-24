@@ -1,14 +1,7 @@
-# Byte-compiled / optimized / DLL files
-__pycache__/
-*.py[cod]
-*$py.class
+/target
 
 .idea
 
 .env
 ecobee_tokens.json
-.venv
-env/
-venv/
-env.bak/
-venv.bak/
+ecobee_tokens.json.tmp

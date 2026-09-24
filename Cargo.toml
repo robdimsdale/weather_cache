@@ -1,0 +1,27 @@
+[package]
+name = "weather_cache"
+version = "0.1.0"
+edition = "2024"
+description = "Caches OpenWeather and ecobee data and serves it over HTTP"
+license = "MIT"
+repository = "https://github.com/robdimsdale/weather_cache"
+
+[dependencies]
+anyhow = "1.0.104"
+axum = "0.8.9"
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls", "query"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "signal", "sync", "time", "fs", "io-util", "net"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[dev-dependencies]
+http-body-util = "0.1.5"
+tempfile = "3.27.0"
+tower = { version = "0.5.3", features = ["util"] }
+wiremock = "0.6.5"
+
+[profile.release]
+strip = true
+lto = true
