@@ -1,12 +1,13 @@
 //! Caches OpenWeather and ecobee data and serves it over HTTP.
 
 mod ecobee;
+mod metrics;
 mod weather;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use axum::extract::State;
@@ -14,6 +15,7 @@ use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
+use metrics::Metrics;
 use serde_json::json;
 use tokio::sync::Mutex;
 use tokio::time::MissedTickBehavior;
@@ -74,7 +76,8 @@ struct Inner {
     http: reqwest::Client,
     /// Raw OpenWeather One Call response body.
     weather: RwLock<String>,
-    ecobee_home: RwLock<Option<ecobee::EcobeeHome>>,
+    ecobee_home: Arc<RwLock<Option<ecobee::EcobeeHome>>>,
+    metrics: Metrics,
     /// Serializes access to the token file, so a refresh can't race an authorization.
     tokens: Mutex<()>,
 }
@@ -85,11 +88,13 @@ impl AppState {
             .timeout(HTTP_TIMEOUT)
             .user_agent(concat!("weather_cache/", env!("CARGO_PKG_VERSION")))
             .build()?;
+        let ecobee_home = Arc::new(RwLock::new(None));
         Ok(Self(Arc::new(Inner {
             config,
             http,
             weather: RwLock::new("{}".into()),
-            ecobee_home: RwLock::new(None),
+            metrics: Metrics::new(ecobee::Readings(ecobee_home.clone())),
+            ecobee_home,
             tokens: Mutex::new(()),
         })))
     }
@@ -138,6 +143,7 @@ pub fn router(state: AppState) -> Router {
         .route("/ecobee_complete_auth", get(ecobee::complete_auth))
         .route("/ecobee_home", get(show_ecobee_home))
         .route("/epoch", get(show_epoch))
+        .route("/metrics", get(show_metrics))
         .with_state(state)
 }
 
@@ -157,21 +163,48 @@ async fn show_epoch() -> Json<u64> {
     Json(now().as_secs())
 }
 
+async fn show_metrics(State(state): State<AppState>) -> Result<impl IntoResponse, ApiError> {
+    let mut body = String::new();
+    prometheus_client::encoding::text::encode(&mut body, &state.0.metrics.registry)?;
+    Ok((
+        [(
+            header::CONTENT_TYPE,
+            "application/openmetrics-text; version=1.0.0; charset=utf-8",
+        )],
+        body,
+    ))
+}
+
 fn now() -> Duration {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system clock is before the unix epoch")
 }
 
-/// Sends `req` and reads the body as text.
-///
-/// reqwest errors include the request URL, which carries API keys and refresh tokens in its
-/// query string, so the URL is stripped before the error can reach a log line or response.
-async fn fetch(req: reqwest::RequestBuilder) -> Result<(StatusCode, String)> {
-    let resp = req.send().await.map_err(reqwest::Error::without_url)?;
-    let status = resp.status();
-    let body = resp.text().await.map_err(reqwest::Error::without_url)?;
-    Ok((status, body))
+impl AppState {
+    /// Sends `req` and reads the body as text, recording the request under `endpoint`.
+    ///
+    /// reqwest errors include the request URL, which carries API keys and refresh tokens in its
+    /// query string, so the URL is stripped before the error can reach a log line or response.
+    async fn fetch(
+        &self,
+        endpoint: &'static str,
+        req: reqwest::RequestBuilder,
+    ) -> Result<(StatusCode, String)> {
+        let start = Instant::now();
+        let result = async {
+            let resp = req.send().await.map_err(reqwest::Error::without_url)?;
+            let status = resp.status();
+            let body = resp.text().await.map_err(reqwest::Error::without_url)?;
+            Ok((status, body))
+        }
+        .await;
+        let status = result.as_ref().ok().map(|(status, _)| *status);
+        self.0
+            .metrics
+            .record_upstream(endpoint, status, start.elapsed());
+        result
+    }
 }
 
 /// An error returned from an HTTP handler as `{"error": message}`.

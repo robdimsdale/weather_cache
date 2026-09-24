@@ -1,12 +1,20 @@
 use anyhow::{Result, bail};
 use tracing::info;
 
-use crate::{AppState, fetch};
+use crate::AppState;
+use crate::metrics::WEATHER;
 
 impl AppState {
     /// Fetches the OpenWeather One Call response and caches it verbatim.
     /// On failure the previously cached response is kept.
     pub async fn update_weather(&self) -> Result<()> {
+        let result = self.fetch_weather().await;
+        let outcome = if result.is_ok() { "success" } else { "error" };
+        self.0.metrics.record_refresh(WEATHER, outcome);
+        result
+    }
+
+    async fn fetch_weather(&self) -> Result<()> {
         info!("updating weather");
         let config = &self.0.config;
         let req = self
@@ -19,7 +27,7 @@ impl AppState {
                 ("appid", &config.app_id),
                 ("units", &config.units),
             ]);
-        let (status, body) = fetch(req).await?;
+        let (status, body) = self.fetch("onecall", req).await?;
         if !status.is_success() {
             bail!("OpenWeather returned {status}: {body}");
         }

@@ -684,3 +684,264 @@ mod ecobee_home {
         assert_eq!(h.get_json("/ecobee_home").await.1, before);
     }
 }
+
+mod metrics {
+    use super::*;
+
+    impl Harness {
+        /// Returns the value of the sample `series` (a metric name plus labels) from `/metrics`.
+        async fn metric(&self, series: &str) -> Option<f64> {
+            let (status, body) = self.get("/metrics").await;
+            assert_eq!(status, StatusCode::OK);
+            body.lines()
+                .find_map(|line| line.strip_prefix(series)?.strip_prefix(' '))
+                .map(|v| v.parse().unwrap())
+        }
+    }
+
+    fn mock_onecall(status: u16) -> Mock {
+        Mock::given(method("GET"))
+            .and(path("/data/3.0/onecall"))
+            .respond_with(ResponseTemplate::new(status).set_body_string("{}"))
+    }
+
+    #[tokio::test]
+    async fn served_as_openmetrics() {
+        let h = harness().await;
+        let resp = router(h.state.clone())
+            .oneshot(Request::get("/metrics").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            resp.headers()["content-type"]
+                .to_str()
+                .unwrap()
+                .starts_with("application/openmetrics-text")
+        );
+        assert_eq!(
+            h.metric(r#"weather_cache_build_info{version="0.1.0"}"#)
+                .await,
+            Some(1.0)
+        );
+    }
+
+    #[tokio::test]
+    async fn records_successful_refresh() {
+        let h = harness().await;
+        mock_onecall(200).mount(&h.server).await;
+        let before = now();
+        h.state.update_weather().await.unwrap();
+
+        assert_eq!(
+            h.metric(r#"weather_cache_refreshes_total{source="weather",result="success"}"#)
+                .await,
+            Some(1.0)
+        );
+        let success = h
+            .metric(r#"weather_cache_last_refresh_success_timestamp_seconds{source="weather"}"#)
+            .await
+            .unwrap();
+        assert!(before <= success && success <= now());
+        assert_eq!(
+            h.metric(r#"weather_cache_upstream_requests_total{endpoint="onecall",status="200"}"#)
+                .await,
+            Some(1.0)
+        );
+        assert_eq!(
+            h.metric(
+                r#"weather_cache_upstream_request_duration_seconds_count{endpoint="onecall"}"#
+            )
+            .await,
+            Some(1.0)
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_refresh_keeps_last_success() {
+        let h = harness().await;
+        mock_onecall(200).up_to_n_times(1).mount(&h.server).await;
+        mock_onecall(500).mount(&h.server).await;
+        h.state.update_weather().await.unwrap();
+        let success = r#"weather_cache_last_refresh_success_timestamp_seconds{source="weather"}"#;
+        let first_success = h.metric(success).await.unwrap();
+        assert!(h.state.update_weather().await.is_err());
+
+        assert_eq!(h.metric(success).await, Some(first_success));
+        let attempt = h
+            .metric(r#"weather_cache_last_refresh_attempt_timestamp_seconds{source="weather"}"#)
+            .await
+            .unwrap();
+        assert!(attempt >= first_success);
+        assert_eq!(
+            h.metric(r#"weather_cache_refreshes_total{source="weather",result="error"}"#)
+                .await,
+            Some(1.0)
+        );
+        assert_eq!(
+            h.metric(r#"weather_cache_upstream_requests_total{endpoint="onecall",status="500"}"#)
+                .await,
+            Some(1.0)
+        );
+    }
+
+    #[tokio::test]
+    async fn unreachable_upstream_counts_as_error_status() {
+        let config = Config {
+            owm_base_url: "http://127.0.0.1:9".into(),
+            ..Config::from_lookup(lookup(&[("LAT", "0"), ("LON", "0"), ("APP_ID", "key")])).unwrap()
+        };
+        let state = AppState::new(config).unwrap();
+        assert!(state.update_weather().await.is_err());
+        let resp = router(state)
+            .oneshot(Request::get("/metrics").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            body.contains(
+                r#"weather_cache_upstream_requests_total{endpoint="onecall",status="error"} 1"#
+            ),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ecobee_unauthorized_is_not_success() {
+        let h = harness().await;
+        h.state.update_ecobee_home().await.unwrap();
+        assert_eq!(
+            h.metric(r#"weather_cache_refreshes_total{source="ecobee",result="unauthorized"}"#)
+                .await,
+            Some(1.0)
+        );
+        assert_eq!(
+            h.metric(r#"weather_cache_last_refresh_success_timestamp_seconds{source="ecobee"}"#)
+                .await,
+            None
+        );
+        assert_eq!(h.metric("weather_cache_ecobee_authorized").await, Some(0.0));
+    }
+
+    #[tokio::test]
+    async fn ecobee_authorized_tracks_auth_flow() {
+        let h = harness().await;
+        h.write_valid_tokens();
+        mock_thermostat(200, ecobee_api_response())
+            .mount(&h.server)
+            .await;
+        h.state.update_ecobee_home().await.unwrap();
+        assert_eq!(h.metric("weather_cache_ecobee_authorized").await, Some(1.0));
+
+        Mock::given(method("GET"))
+            .and(path("/authorize"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ecobeePin": "ab12",
+                "code": "authcode123",
+                "expires_in": 900,
+            })))
+            .mount(&h.server)
+            .await;
+        h.get("/ecobee_authorize").await;
+        assert_eq!(h.metric("weather_cache_ecobee_authorized").await, Some(0.0));
+
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "myaccesstoken",
+                "refresh_token": "myrefreshtoken",
+                "expires_in": 3600,
+            })))
+            .mount(&h.server)
+            .await;
+        h.get("/ecobee_complete_auth").await;
+        assert_eq!(h.metric("weather_cache_ecobee_authorized").await, Some(1.0));
+    }
+
+    #[tokio::test]
+    async fn records_token_refresh() {
+        let h = harness().await;
+        h.write_tokens(json!({
+            "access_token": "oldtoken",
+            "refresh_token": "myrefresh",
+            "expires_at": 0,
+        }));
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(400))
+            .mount(&h.server)
+            .await;
+        assert!(h.state.update_ecobee_home().await.is_err());
+        assert_eq!(
+            h.metric(r#"weather_cache_ecobee_token_refreshes_total{result="error"}"#)
+                .await,
+            Some(1.0)
+        );
+        assert_eq!(
+            h.metric(r#"weather_cache_upstream_requests_total{endpoint="token",status="400"}"#)
+                .await,
+            Some(1.0)
+        );
+    }
+
+    #[tokio::test]
+    async fn no_ecobee_readings_before_first_fetch() {
+        let h = harness().await;
+        let (_, body) = h.get("/metrics").await;
+        assert!(!body.contains("weather_cache_ecobee_connected"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn exports_ecobee_readings() {
+        let h = harness().await;
+        h.write_valid_tokens();
+        let mut body = ecobee_api_response();
+        body["thermostatList"][0]["equipmentStatus"] = json!("heatPump,fan,newThing");
+        mock_thermostat(200, body).mount(&h.server).await;
+        h.state.update_ecobee_home().await.unwrap();
+
+        for (series, value) in [
+            ("weather_cache_ecobee_connected", 1.0),
+            ("weather_cache_ecobee_indoor_temperature_fahrenheit", 72.2),
+            ("weather_cache_ecobee_indoor_humidity_percent", 45.0),
+            ("weather_cache_ecobee_outdoor_temperature_fahrenheit", 48.0),
+            ("weather_cache_ecobee_outdoor_humidity_percent", 60.0),
+            ("weather_cache_ecobee_setpoint_heat_fahrenheit", 70.0),
+            ("weather_cache_ecobee_setpoint_cool_fahrenheit", 76.0),
+            ("weather_cache_ecobee_setpoint_humidity_percent", 40.0),
+            (r#"weather_cache_ecobee_hvac_mode{mode="heat"}"#, 1.0),
+            (r#"weather_cache_ecobee_hvac_mode{mode="cool"}"#, 0.0),
+            (
+                r#"weather_cache_ecobee_equipment_running{equipment="heatPump"}"#,
+                1.0,
+            ),
+            (
+                r#"weather_cache_ecobee_equipment_running{equipment="fan"}"#,
+                1.0,
+            ),
+            (
+                r#"weather_cache_ecobee_equipment_running{equipment="newThing"}"#,
+                1.0,
+            ),
+            (
+                r#"weather_cache_ecobee_equipment_running{equipment="compCool1"}"#,
+                0.0,
+            ),
+            (
+                r#"weather_cache_ecobee_sensor_temperature_fahrenheit{sensor="Living Room"}"#,
+                71.5,
+            ),
+            (
+                r#"weather_cache_ecobee_sensor_occupied{sensor="Living Room"}"#,
+                1.0,
+            ),
+            (
+                r#"weather_cache_ecobee_sensor_occupied{sensor="Bedroom"}"#,
+                0.0,
+            ),
+        ] {
+            assert_eq!(h.metric(series).await, Some(value), "{series}");
+        }
+    }
+}

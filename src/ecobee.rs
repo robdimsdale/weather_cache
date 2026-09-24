@@ -1,17 +1,22 @@
 //! ecobee PIN authorization, token storage and thermostat polling.
 
 use std::path::Path;
+use std::sync::{Arc, RwLock};
 
 use anyhow::{Context, Result, bail};
 use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
+use prometheus_client::collector::Collector;
+use prometheus_client::encoding::{DescriptorEncoder, EncodeGaugeValue};
+use prometheus_client::metrics::MetricType;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use tokio::io::AsyncWriteExt;
 use tracing::{info, warn};
 
-use crate::{ApiError, AppState, fetch, now};
+use crate::metrics::ECOBEE;
+use crate::{ApiError, AppState, now};
 
 /// Contents of the token file.
 ///
@@ -97,6 +102,10 @@ impl AppState {
         let path = &self.0.config.token_file;
         let _guard = self.0.tokens.lock().await;
         let tokens = load_tokens(path).await?;
+        self.0
+            .metrics
+            .ecobee_authorized
+            .set(tokens.access_token.is_some().into());
         let Some(access_token) = tokens.access_token else {
             return Ok(None);
         };
@@ -108,27 +117,46 @@ impl AppState {
         let refresh_token = tokens
             .refresh_token
             .context("ecobee access token expired and no refresh token is stored")?;
+        let result = self.refresh_ecobee_tokens(path, &refresh_token).await;
+        self.0.metrics.record_token_refresh(result.is_ok());
+        Ok(result?.access_token)
+    }
+
+    /// Exchanges `refresh_token` for new tokens and saves them. The caller must hold the tokens lock.
+    async fn refresh_ecobee_tokens(&self, path: &Path, refresh_token: &str) -> Result<Tokens> {
         let req = self.0.http.post(self.ecobee_url("/token")).query(&[
             ("grant_type", "refresh_token"),
-            ("refresh_token", &refresh_token),
+            ("refresh_token", refresh_token),
             ("client_id", self.ecobee_api_key()?),
         ]);
-        let (status, body) = fetch(req).await?;
+        let (status, body) = self.fetch("token", req).await?;
         if !status.is_success() {
             bail!("error refreshing ecobee token: {status}: {body}");
         }
         let tokens = Tokens::from_token_response(&body)?;
         save_tokens(path, &tokens).await?;
-        Ok(tokens.access_token)
+        Ok(tokens)
     }
 
     /// Fetches the first registered thermostat and caches a summary of it.
     /// On failure the previously cached summary is kept.
     pub async fn update_ecobee_home(&self) -> Result<()> {
+        let result = self.fetch_ecobee_home().await;
+        let outcome = match result {
+            Ok(true) => "success",
+            Ok(false) => "unauthorized",
+            Err(_) => "error",
+        };
+        self.0.metrics.record_refresh(ECOBEE, outcome);
+        result.map(|_| ())
+    }
+
+    /// Returns false, without fetching, if ecobee is not yet authorized.
+    async fn fetch_ecobee_home(&self) -> Result<bool> {
         info!("updating ecobee home");
         let Some(access_token) = self.ecobee_access_token().await? else {
             warn!("no ecobee access token - call /ecobee_authorize to set up authentication");
-            return Ok(());
+            return Ok(false);
         };
         let selection = json!({
             "selection": {
@@ -146,7 +174,7 @@ impl AppState {
             .get(self.ecobee_url("/1/thermostat"))
             .bearer_auth(access_token)
             .query(&[("json", selection.to_string())]);
-        let (status, body) = fetch(req).await?;
+        let (status, body) = self.fetch("thermostat", req).await?;
         if !status.is_success() {
             bail!("ecobee returned {status}: {body}");
         }
@@ -159,7 +187,7 @@ impl AppState {
             .context("ecobee returned no thermostats")?;
         *self.0.ecobee_home.write().unwrap() = Some(EcobeeHome::from_thermostat(thermostat)?);
         info!("ecobee home updated");
-        Ok(())
+        Ok(true)
     }
 }
 
@@ -181,7 +209,7 @@ pub(crate) async fn authorize(State(state): State<AppState>) -> Result<Json<Valu
         ("client_id", api_key),
         ("scope", "smartRead"),
     ]);
-    let (status, body) = fetch(req).await?;
+    let (status, body) = state.fetch("authorize", req).await?;
     if !status.is_success() {
         return Err(ApiError::new(status, body));
     }
@@ -194,6 +222,7 @@ pub(crate) async fn authorize(State(state): State<AppState>) -> Result<Json<Valu
         ..Default::default()
     };
     save_tokens(&state.0.config.token_file, &pending).await?;
+    state.0.metrics.ecobee_authorized.set(0);
     Ok(Json(json!({
         "pin": data.ecobee_pin,
         "expires_in_seconds": data.expires_in,
@@ -219,11 +248,12 @@ pub(crate) async fn complete_auth(State(state): State<AppState>) -> Result<Json<
         ("code", &code),
         ("client_id", api_key),
     ]);
-    let (status, body) = fetch(req).await?;
+    let (status, body) = state.fetch("token", req).await?;
     if !status.is_success() {
         return Err(ApiError::new(status, body));
     }
     save_tokens(path, &Tokens::from_token_response(&body)?).await?;
+    state.0.metrics.ecobee_authorized.set(1);
     Ok(Json(json!({ "status": "authorized" })))
 }
 
@@ -411,4 +441,179 @@ impl EcobeeHome {
             sensors,
         })
     }
+}
+
+// Readings from the cached summary, exported on each scrape of /metrics.
+
+/// Values of `equipmentStatus` that are reported as 0 when not running, so they appear in
+/// `/metrics` before they first run.
+const EQUIPMENT: &[&str] = &[
+    "heatPump",
+    "heatPump2",
+    "heatPump3",
+    "compCool1",
+    "compCool2",
+    "auxHeat1",
+    "auxHeat2",
+    "auxHeat3",
+    "fan",
+    "humidifier",
+    "dehumidifier",
+    "ventilator",
+    "economizer",
+    "compHotWater",
+    "auxHotWater",
+];
+
+const HVAC_MODES: &[&str] = &["auto", "auxHeatOnly", "cool", "heat", "off"];
+
+/// Exports the cached `EcobeeHome` as gauges. Nothing is exported until the first fetch.
+#[derive(Debug)]
+pub(crate) struct Readings(pub Arc<RwLock<Option<EcobeeHome>>>);
+
+impl Collector for Readings {
+    fn encode(&self, mut encoder: DescriptorEncoder) -> std::fmt::Result {
+        let Some(home) = self.0.read().unwrap().clone() else {
+            return Ok(());
+        };
+        let e = &mut encoder;
+
+        gauge(
+            e,
+            "ecobee_connected",
+            "Whether the thermostat is connected to ecobee.",
+            i64::from(home.connected),
+        )?;
+        gauge(
+            e,
+            "ecobee_indoor_temperature_fahrenheit",
+            "Indoor temperature.",
+            home.indoor.temperature,
+        )?;
+        gauge(
+            e,
+            "ecobee_indoor_humidity_percent",
+            "Indoor relative humidity.",
+            home.indoor.humidity,
+        )?;
+        gauge(
+            e,
+            "ecobee_outdoor_temperature_fahrenheit",
+            "Outdoor temperature from ecobee's forecast.",
+            home.outdoor.temperature,
+        )?;
+        gauge(
+            e,
+            "ecobee_outdoor_humidity_percent",
+            "Outdoor relative humidity from ecobee's forecast.",
+            home.outdoor.humidity,
+        )?;
+        gauge(
+            e,
+            "ecobee_setpoint_heat_fahrenheit",
+            "Heat setpoint.",
+            home.setpoints.heat,
+        )?;
+        gauge(
+            e,
+            "ecobee_setpoint_cool_fahrenheit",
+            "Cool setpoint.",
+            home.setpoints.cool,
+        )?;
+        gauge(
+            e,
+            "ecobee_setpoint_humidity_percent",
+            "Humidity setpoint.",
+            home.setpoints.humidity,
+        )?;
+
+        let mut mode: Vec<_> = HVAC_MODES
+            .iter()
+            .map(|&m| (m, i64::from(m == home.hvac_mode)))
+            .collect();
+        if !HVAC_MODES.contains(&home.hvac_mode.as_str()) {
+            mode.push((&home.hvac_mode, 1));
+        }
+        gauges(
+            e,
+            "ecobee_hvac_mode",
+            "1 for the current HVAC mode, 0 otherwise.",
+            "mode",
+            mode,
+        )?;
+
+        let running: Vec<&str> = home
+            .equipment_status
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .collect();
+        let mut equipment: Vec<_> = EQUIPMENT
+            .iter()
+            .map(|&eq| (eq, i64::from(running.contains(&eq))))
+            .collect();
+        equipment.extend(
+            running
+                .iter()
+                .filter(|eq| !EQUIPMENT.contains(eq))
+                .map(|&eq| (eq, 1)),
+        );
+        gauges(
+            e,
+            "ecobee_equipment_running",
+            "Whether each piece of HVAC equipment is running.",
+            "equipment",
+            equipment,
+        )?;
+
+        let temperatures = home
+            .sensors
+            .iter()
+            .filter_map(|s| Some((s.name.as_str(), s.temperature?)));
+        gauges(
+            e,
+            "ecobee_sensor_temperature_fahrenheit",
+            "Temperature at each sensor.",
+            "sensor",
+            temperatures,
+        )?;
+        let occupied = home
+            .sensors
+            .iter()
+            .filter_map(|s| Some((s.name.as_str(), i64::from(s.occupancy?))));
+        gauges(
+            e,
+            "ecobee_sensor_occupied",
+            "Whether each sensor detects occupancy.",
+            "sensor",
+            occupied,
+        )?;
+        Ok(())
+    }
+}
+
+fn gauge(
+    e: &mut DescriptorEncoder,
+    name: &str,
+    help: &str,
+    value: impl EncodeGaugeValue,
+) -> std::fmt::Result {
+    e.encode_descriptor(name, help, None, MetricType::Gauge)?
+        .encode_gauge(&value)
+}
+
+/// Encodes one gauge per `(label value, value)` pair, labelled `label`.
+fn gauges<'a, V: EncodeGaugeValue>(
+    e: &mut DescriptorEncoder,
+    name: &str,
+    help: &str,
+    label: &str,
+    values: impl IntoIterator<Item = (&'a str, V)>,
+) -> std::fmt::Result {
+    let mut metric = e.encode_descriptor(name, help, None, MetricType::Gauge)?;
+    for (label_value, value) in values {
+        metric
+            .encode_family(&[(label, label_value)])?
+            .encode_gauge(&value)?;
+    }
+    Ok(())
 }
