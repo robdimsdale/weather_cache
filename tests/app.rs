@@ -259,8 +259,25 @@ fn ecobee_api_response() -> Value {
                 "desiredCool": 760,
                 "desiredFanMode": "auto",
                 "desiredHumidity": 40,
+                "desiredDehumidity": 55,
             },
-            "settings": {"hvacMode": "heat"},
+            "settings": {
+                "hvacMode": "heat",
+                "fanMinOnTime": 10,
+                "humidifierMode": "off",
+                "dehumidifierMode": "on",
+                "auxMaxOutdoorTemp": 400,
+                "auxMaxOutdoorTempEnabled": true,
+                "compressorProtectionMinTemp": 150,
+                "heatStages": 1,
+                "coolStages": 1,
+                "hasHeatPump": true,
+                "hasHumidifier": false,
+                "hasDehumidifier": true,
+                "autoAway": true,
+                "followMeComfort": false,
+            },
+            "extendedRuntime": extended_runtime("2026-09-25", 100, [300, 120, 0], [0, 60, 300]),
             "equipmentStatus": "fan",
             "weather": {
                 "forecasts": [{
@@ -290,8 +307,44 @@ fn ecobee_api_response() -> Value {
                     ],
                 },
             ],
+            "program": {
+                "currentClimateRef": "home",
+                "climates": [
+                    {"name": "Home", "climateRef": "home", "heatTemp": 700, "coolTemp": 760},
+                    {"name": "Away", "climateRef": "away", "heatTemp": 620, "coolTemp": 820},
+                    {"name": "Sleep", "climateRef": "sleep", "heatTemp": 660, "coolTemp": 780},
+                ],
+            },
+            "events": [],
         }]
     })
+}
+
+/// Extended runtime for the three intervals ending at `interval` on `date`, with the given
+/// heat pump and fan seconds and all other equipment idle.
+fn extended_runtime(date: &str, interval: i64, heat_pump: [u64; 3], fan: [u64; 3]) -> Value {
+    let mut runtime = json!({
+        "lastReadingTimestamp": format!("{date} 08:30:00"),
+        "runtimeDate": date,
+        "runtimeInterval": interval,
+        "heatPump1": heat_pump,
+        "fan": fan,
+    });
+    for equipment in [
+        "heatPump2",
+        "auxHeat1",
+        "auxHeat2",
+        "auxHeat3",
+        "cool1",
+        "cool2",
+        "humidifier",
+        "dehumidifier",
+        "economizer",
+        "ventilator",
+    ] {
+        runtime[equipment] = json!([0, 0, 0]);
+    }
+    runtime
 }
 
 fn thermostat_request() -> MockBuilder {
@@ -579,11 +632,35 @@ mod ecobee_home {
                     "temperature": 48.0, "humidity": 60, "condition": "Cloudy",
                     "dewpoint": 38.0, "wind_speed": 10, "wind_direction": "NW",
                 },
-                "setpoints": {"heat": 70.0, "cool": 76.0, "fan_mode": "auto", "humidity": 40},
+                "setpoints": {"heat": 70.0, "cool": 76.0, "fan_mode": "auto", "humidity": 40, "dehumidity": 55},
+                "settings": {
+                    "fan_min_on_time": 10,
+                    "humidifier_mode": "off",
+                    "dehumidifier_mode": "on",
+                    "aux_heat_max_outdoor_temperature": 40.0,
+                    "compressor_min_outdoor_temperature": 15.0,
+                    "heat_stages": 1,
+                    "cool_stages": 1,
+                    "has_heat_pump": true,
+                    "has_humidifier": false,
+                    "has_dehumidifier": true,
+                    "smart_away": true,
+                    "follow_me": false,
+                },
                 "sensors": [
                     {"name": "Living Room", "type": "ecobee3_remote_sensor", "temperature": 71.5, "occupancy": true},
                     {"name": "Bedroom", "type": "ecobee3_remote_sensor", "temperature": 70.5, "occupancy": false},
                 ],
+                "program": {
+                    "comfort_setting": "home",
+                    "scheduled_comfort_setting": "home",
+                    "hold": null,
+                    "comfort_settings": [
+                        {"climate": "home", "name": "Home", "heat": 70.0, "cool": 76.0},
+                        {"climate": "away", "name": "Away", "heat": 62.0, "cool": 82.0},
+                        {"climate": "sleep", "name": "Sleep", "heat": 66.0, "cool": 78.0},
+                    ],
+                },
             })
         );
     }
@@ -600,6 +677,10 @@ mod ecobee_home {
                 "includeSettings": true,
                 "includeWeather": true,
                 "includeSensors": true,
+                "includeEquipmentStatus": true,
+                "includeProgram": true,
+                "includeEvents": true,
+                "includeExtendedRuntime": true,
             }
         });
         thermostat_request()
@@ -644,10 +725,60 @@ mod ecobee_home {
             let t = t.as_object_mut().unwrap();
             t.remove("equipmentStatus");
             t.remove("remoteSensors");
+            t.remove("events");
         }))
         .await;
         assert_eq!(home["equipment_status"], "");
         assert_eq!(home["sensors"], json!([]));
+        assert_eq!(home["program"]["hold"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn disabled_aux_heat_lockout_omitted() {
+        let home = update_with(with_thermostat(|t| {
+            t["settings"]["auxMaxOutdoorTempEnabled"] = json!(false);
+        }))
+        .await;
+        assert_eq!(
+            home["settings"]["aux_heat_max_outdoor_temperature"],
+            Value::Null
+        );
+    }
+
+    #[tokio::test]
+    async fn compressor_lockout_omitted_without_heat_pump() {
+        let home = update_with(with_thermostat(|t| {
+            t["settings"]["hasHeatPump"] = json!(false);
+        }))
+        .await;
+        assert_eq!(
+            home["settings"]["compressor_min_outdoor_temperature"],
+            Value::Null
+        );
+    }
+
+    #[tokio::test]
+    async fn comfort_setting_hold_overrides_schedule() {
+        let home = update_with(with_thermostat(|t| {
+            t["events"] = json!([
+                {"type": "vacation", "running": false, "holdClimateRef": ""},
+                {"type": "hold", "running": true, "holdClimateRef": "sleep"},
+            ]);
+        }))
+        .await;
+        assert_eq!(home["program"]["comfort_setting"], "sleep");
+        assert_eq!(home["program"]["scheduled_comfort_setting"], "home");
+        assert_eq!(home["program"]["hold"], "hold");
+    }
+
+    #[tokio::test]
+    async fn temperature_hold_has_no_comfort_setting() {
+        let home = update_with(with_thermostat(|t| {
+            t["events"] = json!([{"type": "hold", "running": true, "holdClimateRef": ""}]);
+        }))
+        .await;
+        assert_eq!(home["program"]["comfort_setting"], Value::Null);
+        assert_eq!(home["program"]["hold"], "hold");
     }
 
     #[tokio::test]
@@ -940,8 +1071,197 @@ mod metrics {
                 r#"weather_cache_ecobee_sensor_occupied{sensor="Bedroom"}"#,
                 0.0,
             ),
+            (
+                r#"weather_cache_ecobee_comfort_setting{climate="home",name="Home"}"#,
+                1.0,
+            ),
+            (
+                r#"weather_cache_ecobee_comfort_setting{climate="sleep",name="Sleep"}"#,
+                0.0,
+            ),
+            ("weather_cache_ecobee_hold_active", 0.0),
+            ("weather_cache_ecobee_setpoint_dehumidity_percent", 55.0),
+            ("weather_cache_ecobee_fan_min_on_time_minutes", 10.0),
+            ("weather_cache_ecobee_dehumidifier_enabled", 1.0),
+            (
+                "weather_cache_ecobee_aux_heat_max_outdoor_temperature_fahrenheit",
+                40.0,
+            ),
+            (
+                "weather_cache_ecobee_compressor_min_outdoor_temperature_fahrenheit",
+                15.0,
+            ),
+            ("weather_cache_ecobee_smart_away_enabled", 1.0),
+            ("weather_cache_ecobee_follow_me_enabled", 0.0),
+            (
+                r#"weather_cache_ecobee_comfort_setting_heat_fahrenheit{climate="away",name="Away"}"#,
+                62.0,
+            ),
+            (
+                r#"weather_cache_ecobee_comfort_setting_cool_fahrenheit{climate="away",name="Away"}"#,
+                82.0,
+            ),
         ] {
             assert_eq!(h.metric(series).await, Some(value), "{series}");
         }
+    }
+
+    #[tokio::test]
+    async fn humidifier_mode_only_with_humidifier() {
+        let h = harness().await;
+        h.write_valid_tokens();
+        mock_thermostat(200, ecobee_api_response())
+            .mount(&h.server)
+            .await;
+        h.state.update_ecobee_home().await.unwrap();
+        let (_, body) = h.get("/metrics").await;
+        assert!(
+            !body.contains("weather_cache_ecobee_humidifier_mode"),
+            "{body}"
+        );
+
+        let h = harness().await;
+        h.write_valid_tokens();
+        let mut body = ecobee_api_response();
+        body["thermostatList"][0]["settings"]["hasHumidifier"] = json!(true);
+        body["thermostatList"][0]["settings"]["humidifierMode"] = json!("auto");
+        mock_thermostat(200, body).mount(&h.server).await;
+        h.state.update_ecobee_home().await.unwrap();
+        assert_eq!(
+            h.metric(r#"weather_cache_ecobee_humidifier_mode{mode="auto"}"#)
+                .await,
+            Some(1.0)
+        );
+        assert_eq!(
+            h.metric(r#"weather_cache_ecobee_humidifier_mode{mode="off"}"#)
+                .await,
+            Some(0.0)
+        );
+    }
+
+    /// Serves one thermostat response per `update_ecobee_home` call, each with the given
+    /// extended runtime.
+    async fn harness_with_runtimes(runtimes: Vec<Value>) -> Harness {
+        let h = harness().await;
+        h.write_valid_tokens();
+        for runtime in runtimes {
+            let mut body = ecobee_api_response();
+            body["thermostatList"][0]["extendedRuntime"] = runtime;
+            mock_thermostat(200, body)
+                .up_to_n_times(1)
+                .mount(&h.server)
+                .await;
+        }
+        h
+    }
+
+    const HEAT_PUMP_RUNTIME: &str =
+        r#"weather_cache_ecobee_equipment_runtime_seconds_total{equipment="heatPump"}"#;
+    const FAN_RUNTIME: &str =
+        r#"weather_cache_ecobee_equipment_runtime_seconds_total{equipment="fan"}"#;
+
+    #[tokio::test]
+    async fn equipment_runtime_starts_at_zero() {
+        let h = harness_with_runtimes(vec![
+            ecobee_api_response()["thermostatList"][0]["extendedRuntime"].clone(),
+        ])
+        .await;
+        h.state.update_ecobee_home().await.unwrap();
+        assert_eq!(h.metric(HEAT_PUMP_RUNTIME).await, Some(0.0));
+        assert_eq!(
+            h.metric(
+                r#"weather_cache_ecobee_equipment_runtime_seconds_total{equipment="compCool1"}"#
+            )
+            .await,
+            Some(0.0)
+        );
+    }
+
+    #[tokio::test]
+    async fn equipment_runtime_counts_each_interval_once() {
+        let h = harness_with_runtimes(vec![
+            extended_runtime("2026-09-25", 100, [300, 120, 0], [0, 60, 300]),
+            // The same readings again, before the thermostat uploads new ones.
+            extended_runtime("2026-09-25", 100, [300, 120, 0], [0, 60, 300]),
+            // One new interval (101); 99 and 100 were already counted.
+            extended_runtime("2026-09-25", 101, [120, 0, 45], [60, 300, 200]),
+            // Three new intervals.
+            extended_runtime("2026-09-25", 104, [10, 20, 30], [1, 2, 3]),
+        ])
+        .await;
+        for _ in 0..4 {
+            h.state.update_ecobee_home().await.unwrap();
+        }
+        assert_eq!(h.metric(HEAT_PUMP_RUNTIME).await, Some(45.0 + 60.0));
+        assert_eq!(h.metric(FAN_RUNTIME).await, Some(200.0 + 6.0));
+    }
+
+    #[tokio::test]
+    async fn equipment_runtime_counts_across_midnight() {
+        let h = harness_with_runtimes(vec![
+            extended_runtime("2026-09-25", 287, [0, 0, 0], [0, 0, 0]),
+            // Intervals 0 and 1 of the next day, plus 287 of the previous day again.
+            extended_runtime("2026-09-26", 1, [0, 100, 200], [0, 0, 0]),
+        ])
+        .await;
+        h.state.update_ecobee_home().await.unwrap();
+        h.state.update_ecobee_home().await.unwrap();
+        assert_eq!(h.metric(HEAT_PUMP_RUNTIME).await, Some(300.0));
+    }
+
+    #[tokio::test]
+    async fn malformed_runtime_date_is_an_error() {
+        let h =
+            harness_with_runtimes(vec![extended_runtime("not a date", 1, [0; 3], [0; 3])]).await;
+        assert!(h.state.update_ecobee_home().await.is_err());
+        assert_eq!(h.get_json("/ecobee_home").await.1, json!({}));
+    }
+
+    async fn metrics_during_hold(event: Value) -> Harness {
+        let h = harness().await;
+        h.write_valid_tokens();
+        let mut body = ecobee_api_response();
+        body["thermostatList"][0]["events"] = json!([event]);
+        mock_thermostat(200, body).mount(&h.server).await;
+        h.state.update_ecobee_home().await.unwrap();
+        h
+    }
+
+    #[tokio::test]
+    async fn exports_held_comfort_setting() {
+        let h = metrics_during_hold(
+            json!({"type": "hold", "running": true, "holdClimateRef": "sleep"}),
+        )
+        .await;
+        for (series, value) in [
+            (
+                r#"weather_cache_ecobee_comfort_setting{climate="sleep",name="Sleep"}"#,
+                1.0,
+            ),
+            (
+                r#"weather_cache_ecobee_comfort_setting{climate="home",name="Home"}"#,
+                0.0,
+            ),
+            ("weather_cache_ecobee_hold_active", 1.0),
+        ] {
+            assert_eq!(h.metric(series).await, Some(value), "{series}");
+        }
+    }
+
+    #[tokio::test]
+    async fn temperature_hold_exports_no_active_comfort_setting() {
+        let h = metrics_during_hold(json!({"type": "hold", "running": true, "holdClimateRef": ""}))
+            .await;
+        let (_, body) = h.get("/metrics").await;
+        assert!(
+            !body.lines().any(
+                |l| l.starts_with("weather_cache_ecobee_comfort_setting{") && l.ends_with(" 1")
+            ),
+            "{body}"
+        );
+        assert_eq!(
+            h.metric("weather_cache_ecobee_hold_active").await,
+            Some(1.0)
+        );
     }
 }

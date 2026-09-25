@@ -1,5 +1,6 @@
 //! Prometheus metrics served from `/metrics`.
 
+use std::sync::Mutex;
 use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
@@ -42,6 +43,11 @@ struct UpstreamLabels {
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct EquipmentLabels {
+    equipment: &'static str,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct ResultLabels {
     result: &'static str,
 }
@@ -57,6 +63,9 @@ pub(crate) struct Metrics {
     upstream_duration: Family<EndpointLabels, Histogram, fn() -> Histogram>,
     pub ecobee_authorized: Gauge,
     token_refreshes: Family<ResultLabels, Counter>,
+    equipment_runtime: Family<EquipmentLabels, Counter>,
+    /// The last interval counted into `equipment_runtime`, or `None` before the first reading.
+    equipment_runtime_through: Mutex<Option<i64>>,
 }
 
 impl Metrics {
@@ -74,6 +83,8 @@ impl Metrics {
             }),
             ecobee_authorized: Gauge::default(),
             token_refreshes: Family::default(),
+            equipment_runtime: Family::default(),
+            equipment_runtime_through: Mutex::new(None),
         };
         let registry = &mut metrics.registry;
 
@@ -120,6 +131,12 @@ impl Metrics {
             "ecobee access token refreshes by result",
             metrics.token_refreshes.clone(),
         );
+        registry.register_with_unit(
+            "ecobee_equipment_runtime",
+            "Time each piece of HVAC equipment has run, from ecobee's 5-minute runtime intervals",
+            Unit::Seconds,
+            metrics.equipment_runtime.clone(),
+        );
         registry.register_collector(Box::new(readings));
         metrics
     }
@@ -151,6 +168,34 @@ impl Metrics {
         self.upstream_duration
             .get_or_create(&EndpointLabels { endpoint })
             .observe(elapsed.as_secs_f64());
+    }
+
+    /// Adds equipment runtimes for intervals not already counted. `runtimes` maps equipment to
+    /// seconds run in consecutive intervals starting at `first_interval`.
+    ///
+    /// The first call only notes the latest interval: intervals from before a restart may
+    /// already have been counted by the previous process.
+    pub fn record_equipment_runtime(
+        &self,
+        first_interval: i64,
+        runtimes: &[(&'static str, &[u64])],
+    ) {
+        let mut through = self.equipment_runtime_through.lock().unwrap();
+        let mut latest = through.unwrap_or(i64::MIN);
+        for &(equipment, seconds) in runtimes {
+            let counter = self
+                .equipment_runtime
+                .get_or_create(&EquipmentLabels { equipment });
+            for (interval, &secs) in (first_interval..).zip(seconds) {
+                if through.is_some_and(|t| interval > t) {
+                    counter.inc_by(secs);
+                }
+                latest = latest.max(interval);
+            }
+        }
+        if latest != i64::MIN {
+            *through = Some(latest);
+        }
     }
 
     pub fn record_token_refresh(&self, success: bool) {
